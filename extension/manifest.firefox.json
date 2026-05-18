@@ -1,0 +1,58 @@
+{
+  "manifest_version": 3,
+  "name": "DarkMinPDF",
+  "version": "0.4.0",
+  "description": "PDF viewer ported from Min browser with dark mode themes",
+  "author": "hekatonsure",
+  "homepage_url": "https://github.com/hekatonsure/pdf-browser-chrome-extension",
+
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "darkminpdf@hekatonsure",
+      "strict_min_version": "128.0"
+    }
+  },
+
+  "permissions": [
+    "declarativeNetRequestWithHostAccess",
+    "webNavigation",
+    "webRequest",
+    "storage",
+    "downloads"
+  ],
+
+  "host_permissions": [
+    "<all_urls>"
+  ],
+
+  "background": {
+    "scripts": ["background.js"]
+  },
+
+  "content_scripts": [
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "run_at": "document_start",
+      "all_frames": true,
+      "js": ["contentscript.js"]
+    }
+  ],
+
+  "web_accessible_resources": [{
+    "resources": [
+      "viewer/*",
+      "pdfjs/*"
+    ],
+    "matches": ["<all_urls>"]
+  }],
+
+  "action": {
+    "default_title": "DarkMinPDF"
+  },
+
+  "icons": {
+    "16": "assets/icons/icon16.png",
+    "48": "assets/icons/icon48.png",
+    "128": "assets/icons/icon128.png"
+  }
+}

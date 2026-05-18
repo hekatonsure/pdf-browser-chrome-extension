@@ -142,84 +142,44 @@ async function registerPdfRedirectRule() {
     rule.priority = addRules.length - i;
   }
 
+  // Try the full ruleset first (header-condition rules require Chrome 128+ /
+  // Firefox 128+, which both manifest version-gates already enforce). If a
+  // browser rejects the ruleset — e.g. it doesn't accept excludedResponseHeaders
+  // or some other condition field — fall back to URL-only matching so .pdf
+  // links still work.
   try {
-    // Check if responseHeaders is supported (Chrome 128+)
-    if (!(await isHeaderConditionSupported())) {
-      throw new Error("DNR responseHeaders condition is not supported (requires Chrome 128+)");
-    }
     await chrome.declarativeNetRequest.updateDynamicRules({ addRules });
     console.log('PDF Viewer: Registered', addRules.length, 'DNR rules with header conditions');
+    return;
   } catch (e) {
-    console.error("PDF Viewer: Failed to register rules:", e);
-    console.log("PDF Viewer: Falling back to basic .pdf URL matching");
+    console.warn('PDF Viewer: Header-condition rules rejected, falling back:', e?.message || e);
+  }
 
-    // Fallback: simple rules without responseHeaders
-    const fallbackRules = [
-      {
-        id: 1,
-        priority: 100,
-        condition: {
-          regexFilter: "^https?://.*\\.pdf(\\?.*)?$",
-          resourceTypes: ["main_frame"],
-        },
-        action: ACTION_REDIRECT_TO_VIEWER,
+  const fallbackRules = [
+    {
+      id: 1,
+      priority: 100,
+      condition: {
+        regexFilter: "^https?://.*\\.pdf(\\?.*)?$",
+        resourceTypes: ["main_frame"],
       },
-      {
-        id: 2,
-        priority: 100,
-        condition: {
-          regexFilter: "^file://.*\\.pdf$",
-          resourceTypes: ["main_frame"],
-        },
-        action: ACTION_REDIRECT_TO_VIEWER,
+      action: ACTION_REDIRECT_TO_VIEWER,
+    },
+    {
+      id: 2,
+      priority: 100,
+      condition: {
+        regexFilter: "^file://.*\\.pdf$",
+        resourceTypes: ["main_frame"],
       },
-    ];
+      action: ACTION_REDIRECT_TO_VIEWER,
+    },
+  ];
+  try {
     await chrome.declarativeNetRequest.updateDynamicRules({ addRules: fallbackRules });
     console.log('PDF Viewer: Registered', fallbackRules.length, 'fallback DNR rules');
-  }
-}
-
-// Check if responseHeaders condition is supported (Chrome 128+)
-async function isHeaderConditionSupported() {
-  const ruleId = 123456;
-  try {
-    await chrome.declarativeNetRequest.updateSessionRules({
-      addRules: [
-        {
-          id: ruleId,
-          condition: {
-            responseHeaders: [{ header: "whatever" }],
-            urlFilter: "|does_not_match_anything",
-          },
-          action: { type: "block" },
-        },
-      ],
-    });
-  } catch {
-    return false;
-  }
-
-  try {
-    await chrome.declarativeNetRequest.updateSessionRules({
-      removeRuleIds: [ruleId],
-      addRules: [
-        {
-          id: ruleId,
-          condition: {
-            responseHeaders: [],
-            urlFilter: "|does_not_match_anything",
-          },
-          action: { type: "block" },
-        },
-      ],
-    });
-    return false;
-  } catch {
-    return true;
-  } finally {
-    await chrome.declarativeNetRequest.updateSessionRules({
-      removeRuleIds: [ruleId],
-    });
+  } catch (e) {
+    console.error('PDF Viewer: Fallback rule registration also failed:', e);
   }
 }
 
@@ -233,27 +193,66 @@ function getViewerURL(pdf_url) {
   return VIEWER_URL + "?file=" + encodeURIComponent(pdf_url) + hash;
 }
 
-// Fallback for file:// URLs when file access not granted
-chrome.webNavigation.onBeforeNavigate.addListener(
-  function (details) {
-    if (details.frameId === 0) {
-      chrome.extension.isAllowedFileSchemeAccess(function (isAllowedAccess) {
-        if (isAllowedAccess) {
-          return;
-        }
-        chrome.tabs.update(details.tabId, {
-          url: getViewerURL(details.url),
+// Firefox doesn't support DNR responseHeaders conditions, so the fallback rules
+// only match URLs literally ending in .pdf. Catch PDFs served at other URLs by
+// watching Content-Type via webRequest and navigating the tab to the viewer.
+const IS_FIREFOX = typeof navigator !== 'undefined' && /Firefox\//.test(navigator.userAgent);
+
+if (IS_FIREFOX && chrome.webRequest?.onHeadersReceived) {
+  chrome.webRequest.onHeadersReceived.addListener(
+    (details) => {
+      if (details.tabId < 0) return;
+      if (details.url.startsWith(VIEWER_URL)) return;
+      if (details.url.includes('pdfjs.action=download')) return;
+
+      const headers = details.responseHeaders || [];
+      const getHeader = (name) =>
+        headers.find(h => h.name.toLowerCase() === name)?.value?.toLowerCase() || '';
+
+      const contentDisposition = getHeader('content-disposition');
+      if (contentDisposition.startsWith('attachment')) return;
+
+      const contentType = getHeader('content-type');
+      const isPdf =
+        contentType.startsWith('application/pdf') ||
+        (contentType.startsWith('application/octet-stream') && /\.pdf\b/i.test(details.url)) ||
+        /\.pdf(["';]|$)/i.test(contentDisposition);
+
+      if (isPdf) {
+        chrome.tabs.update(details.tabId, { url: getViewerURL(details.url) });
+      }
+    },
+    { urls: ["<all_urls>"], types: ["main_frame", "sub_frame"] },
+    ["responseHeaders"]
+  );
+  console.log('PDF Viewer: Firefox webRequest interceptor registered');
+}
+
+// Fallback for file:// URLs when file access not granted (Chrome only).
+// Firefox grants file:// access via the <all_urls> host permission, so the
+// DNR file:// rule handles it directly and this API is unavailable there.
+if (chrome.extension && chrome.extension.isAllowedFileSchemeAccess) {
+  chrome.webNavigation.onBeforeNavigate.addListener(
+    function (details) {
+      if (details.frameId === 0) {
+        chrome.extension.isAllowedFileSchemeAccess(function (isAllowedAccess) {
+          if (isAllowedAccess) {
+            return;
+          }
+          chrome.tabs.update(details.tabId, {
+            url: getViewerURL(details.url),
+          });
         });
-      });
+      }
+    },
+    {
+      url: [
+        { urlPrefix: "file://", pathSuffix: ".pdf" },
+        { urlPrefix: "file://", pathSuffix: ".PDF" },
+      ],
     }
-  },
-  {
-    url: [
-      { urlPrefix: "file://", pathSuffix: ".pdf" },
-      { urlPrefix: "file://", pathSuffix: ".PDF" },
-    ],
-  }
-);
+  );
+}
 
 // Handle messages from debug page
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
